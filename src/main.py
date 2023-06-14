@@ -16,7 +16,6 @@ def main():
     num_epochs = 10
     learning_rate = 0.001
     
-    input_size = 3 * 32 * 32  # CIFAR-10 image size
     hidden_size = 100
     num_classes = 10
 
@@ -33,7 +32,7 @@ def main():
     validation_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
     
     # Create model architecture
-    network = BaseModel(input_size, hidden_size, num_classes)
+    network = BaseModel(hidden_size, num_classes)
 
     # Perform Fed-Ensemble in federated learning
     ensemble_models = fed_ensemble(NUM_CLIENTS, NUM_MODELS, NUM_SELECTED_CLIENTS, NUM_AGES, BaseModel, train_dataset, 
