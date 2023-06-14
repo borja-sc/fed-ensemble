@@ -1,0 +1,180 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Subset, DataLoader
+
+
+def split_dataset(dataset, num_parties, batch_size, shuffle=True):
+    """
+    Split a given dataset into a number of parties, each containing a part of the dataset.
+    Create data loaders for each party.
+
+    Args:
+        dataset (torch.utils.data.Dataset): The dataset to be split.
+        num_parties (int): The number of parties to split the dataset into.
+        batch_size (int): The batch size for each party's data loader.
+        shuffle (bool, optional): Whether to shuffle the data indices before splitting. 
+                                  Defaults to True.
+
+    Returns:
+        list: A list of data loaders, with each data loader containing a subset of the dataset 
+              assigned to a specific party.
+    """
+    dataset_size = len(dataset)
+    data_indices = list(range(dataset_size))
+    split_size = dataset_size // num_parties
+
+    if shuffle:
+        torch.random.shuffle(data_indices)
+
+    party_data_indices = [data_indices[i:i+split_size] for i in range(0, dataset_size, split_size)]
+    party_dataloaders = []
+
+    for indices in party_data_indices:
+        party_dataset = Subset(dataset, indices)
+        party_dataloader = DataLoader(party_dataset, batch_size=batch_size, shuffle=shuffle)
+        party_dataloaders.append(party_dataloader)
+
+    return party_dataloaders
+
+def test_ensemble_model(model_list, test_loader):
+    """
+    Evaluate an ensemble of deep learning models on a test dataset and calculate the accuracy.
+
+    Args:
+        model_list (list): A list of PyTorch models to form the ensemble.
+        test_loader (torch.utils.data.DataLoader): The data loader for the test dataset.
+
+    Returns:
+        float: The accuracy of the ensemble model on the test dataset.
+
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    for model in model_list:
+        model.eval()
+        model.to(device)
+    
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for data in test_loader:
+            images, labels = data[0].to(device), data[1].to(device)
+            predictions = []
+            
+            for model in model_list:
+                outputs = model(images)
+                probabilities = F.softmax(outputs, dim=1)
+                predictions.append(probabilities)
+            
+            ensemble_predictions = torch.stack(predictions).mean(dim=0)
+            _, predicted = torch.max(ensemble_predictions.data, 1)
+            
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f"Ensemble Accuracy: {accuracy:.2f}%")
+    return accuracy
+
+def client_update(model, optimizer, learning_rate, criterion, train_loader, num_epochs):
+    """
+    Perform a local training update for a client in a federated learning system.
+
+    Args:
+        model (torch.nn.Module): The client model to be trained.
+        optimizer (torch.optim.Optimizer): The optimizer used for training.
+        learning_rate (float): step learning rate
+        criterion (torch.nn.Module): The loss function criterion.
+        train_loader (torch.utils.data.DataLoader): The data loader for the client's training dataset.
+        num_epochs (int): The number of training epochs.
+
+    Returns:
+        torch.nn.Module: The updated client model.
+
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        epoch_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+    return model
+
+def aggregate_models(models):
+    """
+    Aggregate models from multiple clients using Federated Averaging (FedAvg) algorithm.
+
+    Args:
+        models (list): List of client models to be aggregated.
+
+    Returns:
+        torch.nn.Module: Aggregated global model.
+
+    """
+    global_model = models[0].state_dict()
+
+    for key in global_model.keys():
+        global_model[key] = torch.stack([model.state_dict()[key] for model in models]).mean(dim=0)
+
+    return global_model
+
+
+def fed_ensemble(C, T, A, P, initialization):
+    """
+    Implement the Fed-Ensemble algorithm for federated learning.
+
+    Args:
+        num_epochs (int): The number of training epochs for each round.
+        T (int): The number of rounds for the Fed-Ensemble algorithm.
+        C (int): The number of parties (clients) in the federated learning setup.
+        A (int): The number of aggregators used in each round.
+        P (int): The number of participants selected per round.
+        initial_weights (list): The initial weights of the models used in the Fed-Ensemble algorithm.
+
+    Returns:
+        list: The global models trained using the Fed-Ensemble algorithm.
+
+    """
+    # Randomly divide N clients into Q strata
+    Q = len(C) // A
+    strata = [C[i:i+Q] for i in range(0, len(C), Q)]
+
+    for t in range(1, T+1):
+        # Create random permutation matrix to assign aggregators to different stratum in each round of the age
+        permutation_matrix = random.sample(range(A), A)
+
+        for r in range(1, A+1):
+            for q in range(Q):
+                # Randomly select P clients from the stratum
+                selected_clients = random.sample(strata[q], P)
+
+                # Server broadcasts model to clients
+                model = models[permutation_matrix[r-1]]
+                for client in selected_clients:
+                    model = client_update(client, model)
+
+                # Aggregator updates the global model
+                models[permutation_matrix[r]] = aggregator_update([models[permutation_matrix[r-1]][client] for client in selected_clients])
+
+    return models
+
+
