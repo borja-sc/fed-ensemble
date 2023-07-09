@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Subset, DataLoader
+import itertools
+import random
+import numpy as np
 
 
 def split_dataset(dataset, num_parties, batch_size, shuffle=True):
@@ -14,11 +17,11 @@ def split_dataset(dataset, num_parties, batch_size, shuffle=True):
         dataset (torch.utils.data.Dataset): The dataset to be split.
         num_parties (int): The number of parties to split the dataset into.
         batch_size (int): The batch size for each party's data loader.
-        shuffle (bool, optional): Whether to shuffle the data indices before splitting. 
+        shuffle (bool, optional): Whether to shuffle the data indices before splitting.
                                   Defaults to True.
 
     Returns:
-        list: A list of data loaders, with each data loader containing a subset of the dataset 
+        list: A list of data loaders, with each data loader containing a subset of the dataset
               assigned to a specific party.
     """
     dataset_size = len(dataset)
@@ -26,7 +29,7 @@ def split_dataset(dataset, num_parties, batch_size, shuffle=True):
     split_size = dataset_size // num_parties
 
     if shuffle:
-        torch.random.shuffle(data_indices)
+        random.shuffle(data_indices)
 
     party_data_indices = [data_indices[i:i+split_size] for i in range(0, dataset_size, split_size)]
     party_dataloaders = []
@@ -51,35 +54,37 @@ def test_ensemble_model(model_list, test_loader):
 
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     for model in model_list:
         model.eval()
         model.to(device)
-    
+
     correct = 0
     total = 0
-    
+
     with torch.no_grad():
-        for data in test_loader:
-            images, labels = data[0].to(device), data[1].to(device)
+        for data, targets in test_loader:
+            #The target should be a LongTensor using nn.CrossEntropyLoss (or nn.NLLLoss)
+            target = targets.long()
+            images, labels = data.to(device), targets.to(device)
             predictions = []
-            
+
             for model in model_list:
                 outputs = model(images)
                 probabilities = F.softmax(outputs, dim=1)
                 predictions.append(probabilities)
-            
+
             ensemble_predictions = torch.stack(predictions).mean(dim=0)
             _, predicted = torch.max(ensemble_predictions.data, 1)
-            
+
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-    
+
     accuracy = 100 * correct / total
     print(f"Ensemble Accuracy: {accuracy:.2f}%")
     return accuracy
 
-def client_update(model, optimizer, learning_rate, criterion, train_loader, num_epochs):
+def client_update(model, optimizer, train_loader, num_epochs):
     """
     Perform a local training update for a client in a federated learning system.
 
@@ -87,7 +92,6 @@ def client_update(model, optimizer, learning_rate, criterion, train_loader, num_
         model (torch.nn.Module): The client model to be trained.
         optimizer (torch.optim.Optimizer): The optimizer used for training.
         learning_rate (float): step learning rate
-        criterion (torch.nn.Module): The loss function criterion.
         train_loader (torch.utils.data.DataLoader): The data loader for the client's training dataset.
         num_epochs (int): The number of training epochs.
 
@@ -108,7 +112,7 @@ def client_update(model, optimizer, learning_rate, criterion, train_loader, num_
             optimizer.zero_grad()
 
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = torch.nn.functional.cross_entropy(outputs, labels)
             loss.backward()
             optimizer.step()
 
@@ -119,62 +123,104 @@ def client_update(model, optimizer, learning_rate, criterion, train_loader, num_
 
     return model
 
-def aggregate_models(models):
+def aggregate_models(models, global_model, num_clients):
     """
     Aggregate models from multiple clients using Federated Averaging (FedAvg) algorithm.
 
     Args:
-        models (list): List of client models to be aggregated.
+        models ([Model]): List of client models to be aggregated.
+        global_model (Model): Aggregator model to update
+        num_clients (int): number of participating clients in the system
 
     Returns:
         torch.nn.Module: Aggregated global model.
 
     """
-    global_model = models[0].state_dict()
+    global_dict = global_model.state_dict()
 
-    for key in global_model.keys():
-        global_model[key] = torch.stack([model.state_dict()[key] for model in models]).mean(dim=0)
-
+    for key in global_dict.keys():
+        update_dict = torch.stack([model.state_dict()[key].float() for model in models]).mean(dim=0)
+        global_dict[key] = global_dict[key] + update_dict * (1/num_clients)
+    global_model.load_state_dict(global_dict)
     return global_model
 
+def create_permutation_matrix(q, k):
+    """
+    Create a permutation matrix of size q x k.
 
-def fed_ensemble(C, T, A, P, initialization):
+    Args:
+        q (int): The number of strata.
+        k (int): The number of communication rounds in an age (equal to number of aggregators).
+
+    Returns:
+        numpy.ndarray: Permutation matrix of size q x k.
+
+    """
+    perm_matrix = np.zeros((q, k))
+
+    for i in range(q):
+        perm_matrix[i] = np.random.permutation(k)
+
+    perm_matrix = perm_matrix.astype(int).tolist()
+    return perm_matrix
+
+def fed_ensemble(C, T, A, P, test_dataloader, learning_rate, num_epochs, Q):
     """
     Implement the Fed-Ensemble algorithm for federated learning.
 
     Args:
         num_epochs (int): The number of training epochs for each round.
-        T (int): The number of rounds for the Fed-Ensemble algorithm.
-        C (int): The number of parties (clients) in the federated learning setup.
-        A (int): The number of aggregators used in each round.
+        T (int): The number of ages for the Fed-Ensemble algorithm.
+        C ([dataloader]): Local dataset of parties (clients) in the federated learning setup.
+        A ([Model]): List with aggregator models.
         P (int): The number of participants selected per round.
-        initial_weights (list): The initial weights of the models used in the Fed-Ensemble algorithm.
+        test_dataloader (dataloader): Dataset for validation between rounds.
+        learning_rate (float): Learning rate for clients.
+        num_epochs (int): number of epochs for local training
+        Q (int): amount of strata in which to divide the clients
 
     Returns:
         list: The global models trained using the Fed-Ensemble algorithm.
 
     """
+    # create optimizers for the models
+    opt = [optim.SGD(model.parameters(model), lr=learning_rate) for model in A]
     # Randomly divide N clients into Q strata
-    Q = len(C) // A
-    strata = [C[i:i+Q] for i in range(0, len(C), Q)]
+    clients_per_stratum = len(C) // Q
+    strata = [C[i:i+clients_per_stratum] for i in range(0, len(C), clients_per_stratum)]
+    print('strata', len(strata[0]), len(strata))
+    # Create random permutation matrix to assign aggregators to different stratum in each round of the age
+    permutation_matrix = create_permutation_matrix(Q, len(A))
 
-    for t in range(1, T+1):
-        # Create random permutation matrix to assign aggregators to different stratum in each round of the age
-        permutation_matrix = random.sample(range(A), A)
-
-        for r in range(1, A+1):
-            for q in range(Q):
+    for t in range(0, T): # for each age
+        for r in range(len(A)): # for each round
+            client_models = [[] for x in range(len(A))]
+            for q in range(Q): # for each stratum
                 # Randomly select P clients from the stratum
                 selected_clients = random.sample(strata[q], P)
+                print('selected clients', selected_clients)
 
                 # Server broadcasts model to clients
-                model = models[permutation_matrix[r-1]]
+                model = A[permutation_matrix[q][r]]
                 for client in selected_clients:
-                    model = client_update(client, model)
-
-                # Aggregator updates the global model
-                models[permutation_matrix[r]] = aggregator_update([models[permutation_matrix[r-1]][client] for client in selected_clients])
+                    client_models[permutation_matrix[q][r]].append(client_update(model, opt[permutation_matrix[q][r]], client, num_epochs))
+            # Aggregator updates the global model
+            models = [aggregate_models(client_models[agg], A[agg], len(C)) for agg in range(len(A))]
+        # Test after every age
+        test_ensemble_model(models, test_dataloader)
 
     return models
 
-
+def train(num_participants, num_models_in_ensemble, num_selected_participants, num_training_ages, Model, training_dataset,
+                                   test_dataset, samples_per_batch, num_epoch, l_r, num_strata):
+    # Create dataloaders
+    train_dataloaders_clients = split_dataset(training_dataset, num_participants, samples_per_batch)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=samples_per_batch, shuffle=True)
+    
+    # Run Fed-Ensemble
+    models_in_ensemble = list(itertools.repeat(Model(), num_models_in_ensemble))
+    ensemble = fed_ensemble(train_dataloaders_clients, num_training_ages, models_in_ensemble, num_selected_participants, test_dataloader, l_r, num_epoch, num_strata)
+    
+    # Save all models
+    for idx, aggregator in enumerate(ensemble):
+    torch.save(aggregator.state_dict(), 'ensemble_model_{}.pth'.format(idx))
