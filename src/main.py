@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 from torchvision import datasets, transforms
-from FedEnsemble import fed_ensemble
+from FedEnsemble import train
 from models import BaseModel
 
 def main():
