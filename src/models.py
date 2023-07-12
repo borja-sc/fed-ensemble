@@ -3,11 +3,11 @@ import torch.nn as nn
 from torchvision import models
 
 class BaseModel(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, hidden_size = 512, num_classes = 10):
         super(BaseModel, self).__init__()
 
         self.model = models.resnet18(pretrained=False)
-        self.fc1 = nn.Linear(512, hidden_size) 
+        self.fc1 = nn.Linear(512, hidden_size)
         self.fc2 = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
