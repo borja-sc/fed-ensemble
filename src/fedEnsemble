@@ -139,7 +139,7 @@ def aggregate_models(models, global_model, num_clients):
     global_dict = global_model.state_dict()
 
     for key in global_dict.keys():
-        update_dict = torch.stack([model.state_dict()[key].float() for model in models]).mean(dim=0)
+        update_dict = torch.stack([(model.state_dict()[key].float() - global_dict[key].float()) for model in models], 0).sum(dim=0)
         global_dict[key] = global_dict[key] + update_dict * (1/num_clients)
     global_model.load_state_dict(global_dict)
     return global_model
